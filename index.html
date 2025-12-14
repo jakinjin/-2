@@ -1,0 +1,602 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Luxury Particle Christmas - Gesture Control</title>
+    
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@400;700&family=Times+New+Roman&display=swap" rel="stylesheet">
+
+    <style>
+        :root {
+            --bg-color: #001a0d; /* 深祖母绿背景 */
+            --gold-color: #D4AF37;
+        }
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: var(--bg-color);
+            font-family: 'Cinzel', serif;
+            color: var(--gold-color);
+            user-select: none;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            position: absolute;
+            top: 0;
+            left: 0;
+            z-index: 1;
+        }
+        /* 隐藏视频元素，只用于分析 */
+        #webcam {
+            position: absolute;
+            opacity: 0;
+            width: 1px; 
+            height: 1px;
+            pointer-events: none;
+        }
+        #ui {
+            position: absolute;
+            bottom: 30px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 10;
+            text-align: center;
+            pointer-events: none;
+            text-shadow: 0 0 10px rgba(212, 175, 55, 0.5);
+        }
+        .status {
+            font-size: 14px;
+            letter-spacing: 2px;
+            opacity: 0.8;
+            margin-bottom: 10px;
+        }
+        .instructions {
+            font-size: 12px;
+            color: #8fbc8f;
+            font-family: 'Times New Roman', serif;
+            font-style: italic;
+        }
+        #loader {
+            position: fixed;
+            top: 0; left: 0; width: 100%; height: 100%;
+            background: var(--bg-color);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            z-index: 100;
+            flex-direction: column;
+            transition: opacity 1s ease;
+        }
+        .loader-text {
+            font-size: 24px;
+            color: var(--gold-color);
+            animation: pulse 2s infinite;
+        }
+        @keyframes pulse {
+            0% { opacity: 0.5; text-shadow: 0 0 5px var(--gold-color); }
+            50% { opacity: 1; text-shadow: 0 0 20px var(--gold-color); }
+            100% { opacity: 0.5; text-shadow: 0 0 5px var(--gold-color); }
+        }
+    </style>
+</head>
+<body>
+
+    <div id="loader">
+        <div class="loader-text">INITIALIZING AI & 3D ENGINE...</div>
+        <div style="margin-top:10px; font-size:12px; color:#555;">Please allow camera access</div>
+    </div>
+
+    <div id="ui">
+        <div class="status" id="gesture-status">WAITING FOR HAND...</div>
+        <div class="instructions">
+            ✊ Fist: Tree | 🖐 Open: Scatter | 🫰 Pinch: Heart | ✌️ Victory: Text
+        </div>
+    </div>
+
+    <video id="webcam" autoplay playsinline></video>
+    <div id="canvas-container"></div>
+
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+            "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+            "@mediapipe/tasks-vision": "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.8/+esm"
+        }
+    }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+        import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+        import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+        import { FilesetResolver, HandLandmarker } from '@mediapipe/tasks-vision';
+
+        // --- Configuration ---
+        const PARTICLE_COUNT = 18000;
+        const TEXT_PARTICLE_COUNT = 3000;
+        const COLORS = {
+            emerald: new THREE.Color(0x008f39),
+            darkGreen: new THREE.Color(0x004218),
+            gold: new THREE.Color(0xFFD700),
+            brown: new THREE.Color(0x5C4033),
+            white: new THREE.Color(0xFFFFFF),
+            lights: [
+                new THREE.Color(0xFF0000), // Red
+                new THREE.Color(0xFFFF00), // Yellow
+                new THREE.Color(0x0000FF), // Blue
+                new THREE.Color(0x800080), // Purple
+                new THREE.Color(0xFFFFFF)  // White
+            ]
+        };
+
+        // --- Global State ---
+        let scene, camera, renderer, composer, controls;
+        let particles, geometry, material;
+        let handLandmarker;
+        let webcam;
+        let lastVideoTime = -1;
+        let targetPositions = []; // Array of Float32Arrays for morph targets
+        let currentGesture = 'fist'; // Default
+        let handPosition = new THREE.Vector3(0, 0, 0);
+        
+        // Indices for shapes
+        const SHAPE_TREE = 0;
+        const SHAPE_SCATTER = 1;
+        const SHAPE_HEART = 2;
+        const SHAPE_TEXT = 3;
+        
+        // --- Initialization ---
+        async function init() {
+            // 1. Setup Three.js Scene
+            scene = new THREE.Scene();
+            scene.fog = new THREE.FogExp2(0x001a0d, 0.02);
+
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.z = 30;
+            camera.position.y = 5;
+
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.toneMapping = THREE.ReinhardToneMapping;
+            document.getElementById('canvas-container').appendChild(renderer.domElement);
+
+            // 2. Post Processing (Bloom for "Luxury" Glow)
+            const renderScene = new RenderPass(scene, camera);
+            const bloomPass = new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 1.5, 0.4, 0.85);
+            bloomPass.threshold = 0.2;
+            bloomPass.strength = 1.2; // Strong cinematic glow
+            bloomPass.radius = 0.5;
+
+            composer = new EffectComposer(renderer);
+            composer.addPass(renderScene);
+            composer.addPass(bloomPass);
+
+            // 3. Create Particles
+            createParticles();
+
+            // 4. Create Background Snow (Ambient)
+            createSnow();
+
+            // 5. Setup AI (MediaPipe)
+            await setupMediaPipe();
+
+            // 6. Start Loop
+            document.getElementById('loader').style.opacity = 0;
+            setTimeout(() => document.getElementById('loader').remove(), 1000);
+            animate();
+        }
+
+        // --- Particle System Generation ---
+        function createParticles() {
+            geometry = new THREE.BufferGeometry();
+            const positions = new Float32Array(PARTICLE_COUNT * 3);
+            const colors = new Float32Array(PARTICLE_COUNT * 3);
+            const sizes = new Float32Array(PARTICLE_COUNT);
+            const originalColors = new Float32Array(PARTICLE_COUNT * 3); // Store base color type
+
+            const treePos = new Float32Array(PARTICLE_COUNT * 3);
+            const scatterPos = new Float32Array(PARTICLE_COUNT * 3);
+            const heartPos = new Float32Array(PARTICLE_COUNT * 3);
+            const textPos = new Float32Array(PARTICLE_COUNT * 3);
+
+            // --- Generate Shapes ---
+            
+            // 1. Christmas Tree (Cone + Cylinder Trunk)
+            for (let i = 0; i < PARTICLE_COUNT; i++) {
+                // Initialize colors
+                const color = new THREE.Color();
+                let size = 0.2;
+                let isLight = false;
+
+                // Tree Logic
+                const i3 = i * 3;
+                
+                // 80% Leaves, 10% Trunk, 10% Lights
+                const type = Math.random();
+
+                if (type > 0.2) { 
+                    // LEAVES (Cone)
+                    const height = 20;
+                    const y = Math.random() * height - height/2 + 2; // Bias up
+                    const radius = (1 - (y + height/2 - 2)/height) * 8; // Taper
+                    const angle = Math.random() * Math.PI * 2;
+                    const r = Math.random() * radius; // Volume
+                    
+                    treePos[i3] = Math.cos(angle) * r;
+                    treePos[i3+1] = y;
+                    treePos[i3+2] = Math.sin(angle) * r;
+
+                    // Color: Mix of Emerald and Dark Green
+                    if (Math.random() > 0.5) color.copy(COLORS.emerald);
+                    else color.copy(COLORS.darkGreen);
+                    
+                    // Add some gold dust
+                    if (Math.random() > 0.95) {
+                        color.copy(COLORS.gold);
+                        size = 0.4;
+                    }
+
+                } else if (type > 0.05) {
+                    // TRUNK (Cylinder)
+                    const r = Math.random() * 1.5;
+                    const angle = Math.random() * Math.PI * 2;
+                    const y = (Math.random() * 6) - 12; // Bottom
+
+                    treePos[i3] = Math.cos(angle) * r;
+                    treePos[i3+1] = y;
+                    treePos[i3+2] = Math.sin(angle) * r;
+                    color.copy(COLORS.brown);
+
+                } else {
+                    // LIGHTS & STARS
+                    // Surface of cone
+                    const height = 20;
+                    const y = Math.random() * height - height/2 + 2;
+                    const radius = (1 - (y + height/2 - 2)/height) * 8;
+                    const angle = Math.random() * Math.PI * 2;
+                    
+                    treePos[i3] = Math.cos(angle) * radius; // On surface
+                    treePos[i3+1] = y;
+                    treePos[i3+2] = Math.sin(angle) * radius;
+
+                    const lightCol = COLORS.lights[Math.floor(Math.random() * COLORS.lights.length)];
+                    color.copy(lightCol);
+                    size = 0.6; // Bigger lights
+                    isLight = true;
+                }
+
+                // Assign Colors & Sizes
+                colors[i3] = color.r;
+                colors[i3+1] = color.g;
+                colors[i3+2] = color.b;
+                sizes[i] = size;
+                
+                // Store metadata in alpha/unused buffer if needed, here simple arrays
+                originalColors[i3] = color.r; 
+                originalColors[i3+1] = color.g;
+                originalColors[i3+2] = color.b;
+
+                // 2. Scatter Shape (Sphere/Explosion)
+                const sr = 30 * Math.cbrt(Math.random());
+                const theta = Math.random() * 2 * Math.PI;
+                const phi = Math.acos(2 * Math.random() - 1);
+                scatterPos[i3] = sr * Math.sin(phi) * Math.cos(theta);
+                scatterPos[i3+1] = sr * Math.sin(phi) * Math.sin(theta);
+                scatterPos[i3+2] = sr * Math.cos(phi);
+
+                // 3. Heart Shape (Parametric)
+                // x = 16sin^3(t)
+                // y = 13cos(t) - 5cos(2t) - 2cos(3t) - cos(4t)
+                const t = Math.random() * Math.PI * 2;
+                // Add volume
+                const scale = 0.8;
+                const spread = 2 * Math.random();
+                heartPos[i3] = (16 * Math.pow(Math.sin(t), 3)) * scale + (Math.random()-0.5);
+                heartPos[i3+1] = (13 * Math.cos(t) - 5 * Math.cos(2*t) - 2 * Math.cos(3*t) - Math.cos(4*t)) * scale + (Math.random()-0.5);
+                heartPos[i3+2] = (Math.random() - 0.5) * 5; // Depth
+            }
+
+            // 4. Text Shape (Merry Christmas) - Uses Canvas API
+            const textPoints = generateTextParticles("Merry Christmas", PARTICLE_COUNT);
+            for(let i=0; i<PARTICLE_COUNT; i++) {
+                const i3 = i*3;
+                if(i < textPoints.length) {
+                    textPos[i3] = textPoints[i].x;
+                    textPos[i3+1] = textPoints[i].y;
+                    textPos[i3+2] = textPoints[i].z;
+                } else {
+                    // Hide extra particles inside the text
+                    textPos[i3] = (Math.random()-0.5)*10;
+                    textPos[i3+1] = (Math.random()-0.5)*5;
+                    textPos[i3+2] = (Math.random()-0.5)*2;
+                }
+            }
+
+            // Initialize current positions to scatter
+            positions.set(scatterPos);
+
+            geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+            geometry.setAttribute('size', new THREE.BufferAttribute(sizes, 1));
+
+            // Custom Shader Material for "Luxury" look + Size attenuation
+            const sprite = new THREE.TextureLoader().load('https://threejs.org/examples/textures/sprites/spark1.png');
+
+            material = new THREE.PointsMaterial({
+                size: 0.5,
+                map: sprite,
+                vertexColors: true,
+                blending: THREE.AdditiveBlending,
+                depthWrite: false,
+                transparent: true,
+                opacity: 0.9
+            });
+
+            particles = new THREE.Points(geometry, material);
+            scene.add(particles);
+
+            targetPositions = [treePos, scatterPos, heartPos, textPos];
+        }
+
+        // --- Text Generation Helper ---
+        function generateTextParticles(text, maxPoints) {
+            const canvas = document.createElement('canvas');
+            const ctx = canvas.getContext('2d');
+            canvas.width = 1024;
+            canvas.height = 256;
+            
+            ctx.fillStyle = '#000000';
+            ctx.fillRect(0,0, canvas.width, canvas.height);
+            
+            ctx.font = 'bold 120px "Cinzel"';
+            ctx.fillStyle = '#FFFFFF';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(text, canvas.width/2, canvas.height/2);
+
+            const imgData = ctx.getImageData(0,0, canvas.width, canvas.height);
+            const data = imgData.data;
+            const points = [];
+            
+            // Scan pixels
+            for(let y=0; y<canvas.height; y+=4) { // Step for density
+                for(let x=0; x<canvas.width; x+=4) {
+                    const alpha = data[(y * canvas.width + x) * 4]; // Red channel is enough since white text
+                    if(alpha > 128) {
+                        points.push({
+                            x: (x - canvas.width/2) * 0.05,
+                            y: -(y - canvas.height/2) * 0.05, // Flip Y
+                            z: 0
+                        });
+                    }
+                }
+            }
+            return points;
+        }
+
+        // --- Ambient Snow ---
+        function createSnow() {
+            const snowGeo = new THREE.BufferGeometry();
+            const snowPos = [];
+            for(let i=0; i<1000; i++) {
+                snowPos.push((Math.random()-0.5)*60);
+                snowPos.push(Math.random()*40 - 10);
+                snowPos.push((Math.random()-0.5)*60);
+            }
+            snowGeo.setAttribute('position', new THREE.Float32BufferAttribute(snowPos, 3));
+            const snowMat = new THREE.PointsMaterial({
+                color: 0xffffff,
+                size: 0.3,
+                transparent: true,
+                opacity: 0.6,
+                blending: THREE.AdditiveBlending
+            });
+            const snowSystem = new THREE.Points(snowGeo, snowMat);
+            snowSystem.userData = { velocity: [] };
+            for(let i=0; i<1000; i++) snowSystem.userData.velocity.push(Math.random()*0.1 + 0.05);
+            
+            scene.add(snowSystem);
+            
+            // Animate Snow function
+            scene.userData.animateSnow = () => {
+                const positions = snowSystem.geometry.attributes.position.array;
+                for(let i=1; i<positions.length; i+=3) {
+                    positions[i] -= snowSystem.userData.velocity[(i-1)/3];
+                    if(positions[i] < -20) positions[i] = 20;
+                }
+                snowSystem.geometry.attributes.position.needsUpdate = true;
+            };
+        }
+
+        // --- MediaPipe Setup ---
+        async function setupMediaPipe() {
+            const vision = await FilesetResolver.forVisionTasks(
+                "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.8/wasm"
+            );
+            handLandmarker = await HandLandmarker.createFromOptions(vision, {
+                baseOptions: {
+                    modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+                    delegate: "GPU"
+                },
+                runningMode: "VIDEO",
+                numHands: 1
+            });
+            
+            // Setup Webcam
+            webcam = document.getElementById('webcam');
+            const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+            webcam.srcObject = stream;
+            
+            return new Promise((resolve) => {
+                webcam.onloadeddata = () => {
+                    resolve();
+                }
+            });
+        }
+
+        // --- Logic: Gesture Detection ---
+        function detectGesture(landmarks) {
+            // Landmarks: 0=Wrist, 4=ThumbTip, 8=IndexTip, 12=MidTip, 16=RingTip, 20=PinkyTip
+            const thumbTip = landmarks[4];
+            const indexTip = landmarks[8];
+            const midTip = landmarks[12];
+            const ringTip = landmarks[16];
+            const pinkyTip = landmarks[20];
+            const wrist = landmarks[0];
+
+            // Helper: Distance
+            const dist = (p1, p2) => Math.sqrt(Math.pow(p1.x-p2.x, 2) + Math.pow(p1.y-p2.y, 2) + Math.pow(p1.z-p2.z, 2));
+            
+            // Check Fingers Extended (Tip further from wrist than lower joints)
+            // Simplified check based on y-coords (usually sufficient for upright hand)
+            const isFingerUp = (tipIdx, pipIdx) => landmarks[tipIdx].y < landmarks[pipIdx].y; 
+
+            // 1. PINCH (Heart) - Thumb and Index close
+            if (dist(thumbTip, indexTip) < 0.05) {
+                return 'heart';
+            }
+
+            // 2. FIST (Tree) - All fingers curled
+            // Checking if tips are close to wrist or palm center (index 9)
+            const palmCenter = landmarks[9];
+            const fingersOpen = [8,12,16,20].filter(idx => dist(landmarks[idx], wrist) > dist(landmarks[5], wrist) * 1.5).length;
+            
+            if (fingersOpen === 0) return 'tree';
+
+            // 3. VICTORY (Text) - Index and Middle up, others down
+            const indexUp = dist(indexTip, wrist) > 0.2;
+            const midUp = dist(midTip, wrist) > 0.2;
+            const ringDown = dist(ringTip, wrist) < 0.2; // tighter threshold
+            
+            // Better check for V-sign
+            if (indexUp && midUp && !ringDown && fingersOpen === 2) {
+                 // Check separation
+                 if(dist(indexTip, midTip) > 0.05) return 'text';
+            }
+
+            // 4. OPEN (Scatter) - All fingers up
+            if (fingersOpen >= 4) return 'scatter';
+
+            return currentGesture; // Hold previous state if ambiguous
+        }
+
+        // --- Animation Loop ---
+        const clock = new THREE.Clock();
+        
+        function animate() {
+            requestAnimationFrame(animate);
+            const time = clock.getElapsedTime();
+
+            // 1. MediaPipe Process
+            if (webcam && webcam.currentTime !== lastVideoTime) {
+                lastVideoTime = webcam.currentTime;
+                const startTimeMs = performance.now();
+                const result = handLandmarker.detectForVideo(webcam, startTimeMs);
+
+                if (result.landmarks && result.landmarks.length > 0) {
+                    const landmarks = result.landmarks[0];
+                    
+                    // Update Gesture
+                    const newGesture = detectGesture(landmarks);
+                    if(newGesture !== currentGesture) {
+                        currentGesture = newGesture;
+                        
+                        // Update UI
+                        const statusDiv = document.getElementById('gesture-status');
+                        const map = { 'tree': 'MERRY CHRISTMAS TREE', 'scatter': 'SCATTERING STARS', 'heart': 'WITH LOVE', 'text': 'GREETINGS' };
+                        statusDiv.innerText = map[currentGesture] || 'DETECTING...';
+                        
+                        // Set Target Buffer
+                        /* Indices:
+                           0: Tree
+                           1: Scatter
+                           2: Heart
+                           3: Text
+                        */
+                    }
+
+                    // Update Hand Position (Map 0-1 to World Coords)
+                    // X needs to be inverted for mirror feel
+                    const x = (1 - landmarks[9].x) * 2 - 1; // -1 to 1
+                    const y = (1 - landmarks[9].y) * 2 - 1; 
+                    
+                    // Smooth lerp for hand movement
+                    handPosition.lerp(new THREE.Vector3(x * 20, y * 20, 0), 0.1);
+                }
+            }
+
+            // 2. Particle Morphing Logic
+            const positions = particles.geometry.attributes.position.array;
+            let targetBuffer;
+
+            if (currentGesture === 'tree') targetBuffer = targetPositions[SHAPE_TREE];
+            else if (currentGesture === 'heart') targetBuffer = targetPositions[SHAPE_HEART];
+            else if (currentGesture === 'text') targetBuffer = targetPositions[SHAPE_TEXT];
+            else targetBuffer = targetPositions[SHAPE_SCATTER];
+
+            for (let i = 0; i < PARTICLE_COUNT; i++) {
+                const i3 = i * 3;
+                
+                // Get target coordinate + Hand Offset
+                let tx = targetBuffer[i3] + handPosition.x;
+                let ty = targetBuffer[i3+1] + handPosition.y;
+                let tz = targetBuffer[i3+2] + handPosition.z;
+
+                // Add "Breathing" / Swaying effect based on time
+                if(currentGesture === 'tree') {
+                    tx += Math.sin(time * 2 + ty * 0.5) * 0.1; // Wind
+                }
+
+                // Lerp current to target
+                positions[i3] += (tx - positions[i3]) * 0.08;
+                positions[i3+1] += (ty - positions[i3+1]) * 0.08;
+                positions[i3+2] += (tz - positions[i3+2]) * 0.08;
+            }
+            particles.geometry.attributes.position.needsUpdate = true;
+
+            // 3. Dynamic Lighting (Blinking Lights)
+            const colors = particles.geometry.attributes.color.array;
+            for(let i = 0; i < PARTICLE_COUNT; i++) {
+                // If it's a light (we can infer from index or checking color, simplified here just blink randoms)
+                if (i % 20 === 0) { // Assume every 20th particle is a "light" candidate
+                    const i3 = i*3;
+                    const brightness = (Math.sin(time * 3 + i) + 1) / 2 + 0.5; // 0.5 to 1.5
+                    colors[i3] *= brightness; // Warning: this accumulates if not reset, but visually looks like shimmering
+                    // Reset roughly to base to prevent infinite explosion
+                    if(colors[i3] > 2) colors[i3] = 1; 
+                }
+            }
+            particles.geometry.attributes.color.needsUpdate = true;
+            
+            // Rotate particles container slightly for 3D feel
+            particles.rotation.y = Math.sin(time * 0.2) * 0.1;
+
+            // 4. Update Snow
+            if(scene.userData.animateSnow) scene.userData.animateSnow();
+
+            // 5. Render
+            composer.render();
+        }
+
+        // Start
+        init();
+
+        // Handle Resize
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            composer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+    </script>
+</body>
+</html>
